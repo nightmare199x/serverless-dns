@@ -11,6 +11,7 @@ import * as bufutil from "../commons/bufutil.js";
 import * as dnsutil from "../commons/dnsutil.js";
 import * as envutil from "../commons/envutil.js";
 import * as util from "../commons/util.js";
+import { log } from "../core/log.js";
 import { DnsCacheData } from "./cache-util.js";
 import * as pres from "./plugin-response.js";
 import { BlocklistFilter } from "./rethinkdns/filter.js";
@@ -423,12 +424,22 @@ export function base64ToUintV1(b64Flag) {
 
 /**
  * @param {string} b64Flag
- * @returns {Uint16Array}
+ * @returns {Uint16Array?}
  */
 export function base32ToUintV1(flag) {
-  // TODO: check for empty flag
-  const b32 = decodeURI(flag);
-  return bufutil.decodeFromBinaryArray(rbase32(b32));
+  try {
+    if (util.emptyString(flag)) return null;
+    const b32 = decodeURI(flag);
+    if (util.emptyString(b32)) return null;
+
+    const decoded = rbase32(b32);
+    if (util.emptyString(decoded)) return null;
+
+    return bufutil.decodeFromBinaryArray(decoded);
+  } catch (e) {
+    log.w("Rdns:base32ToUintV1", "error decoding b32 flag", e);
+  }
+  return null;
 }
 
 /**
@@ -475,7 +486,7 @@ export function stampVersion(s) {
 // TODO: The logic to parse stamps must be kept in sync with:
 // github.com/celzero/website-dns/blob/8e6056bb/src/js/flag.js#L260-L425
 /**
- *
+ * May return empty BlockstampInfo if flag is invalid or empty.
  * @param {string} flag
  * @returns {pres.BlockstampInfo}
  */
@@ -499,7 +510,7 @@ export function unstamp(flag) {
   } else if (v === "1") {
     const convertor = isFlagB32 ? base32ToUintV1 : base64ToUintV1;
     const f = s[1];
-    r.userBlocklistFlagUint = convertor(f) || null;
+    r.userBlocklistFlagUint = convertor(f) || null; // convertor may return null
   } else {
     log.w("Rdns:unstamp", "unknown blocklist stamp version in " + s);
   }

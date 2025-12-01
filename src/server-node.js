@@ -12,13 +12,15 @@ import "./core/node/config.js";
 
 import { LfuCache } from "@serverless-dns/lfu-cache";
 import * as h2c from "httpx-server";
+import { X509Certificate } from "node:crypto";
 import http2 from "node:http2";
 import https from "node:https";
 import net, { isIPv6 } from "node:net";
-import os from "node:os";
 import { finished } from "node:stream";
 import tls, { TLSSocket } from "node:tls";
 import v8 from "node:v8";
+import os from "os";
+import process from "process";
 import { V2ProxyProtocol } from "proxy-protocol-js";
 import * as bufutil from "./commons/bufutil.js";
 import * as nodecrypto from "./commons/crypto.js";
@@ -26,10 +28,12 @@ import * as dnsutil from "./commons/dnsutil.js";
 import * as envutil from "./commons/envutil.js";
 import * as util from "./commons/util.js";
 import { handleRequest } from "./core/doh.js";
+import { log as log2, loggerWithTags } from "./core/log.js";
+import { setTlsVars } from "./core/node/config.js";
 import * as nodeutil from "./core/node/util.js";
+import * as psk from "./core/psk.js";
 import { stopAfter, uptime } from "./core/svc.js";
 import * as system from "./system.js";
-
 /**
  * @typedef {net.Socket} Socket
  * @typedef {http2.Http2ServerRequest} Http2ServerRequest
@@ -47,6 +51,10 @@ class Stats {
     this.noreqs = -1;
     this.nofchecks = 0;
     this.tlserr = 0;
+    this.tlspsks = 0;
+    this.tlspskd = 0;
+    this.tlspskmiss = 0;
+    this.tottlspsk = 0;
     this.fasttls = 0;
     this.totfasttls = 0;
     this.noftlsadjs = 0;
@@ -63,8 +71,9 @@ class Stats {
     return (
       `reqs=${this.noreqs} c=${this.nofchecks} ` +
       `drops=${this.nofdrops}/tot=${this.nofconns}/open=${this.openconns} ` +
-      `to=${this.noftimeouts}/tlserr=${this.tlserr} ` +
+      `to=${this.noftimeouts}/tlserr=${this.tlserr}/tlspskmiss=${this.tlspskmiss} ` +
       `tls0=${this.fasttls}/tls0miss=${this.totfasttls}/tlsadjs=${this.noftlsadjs} ` +
+      `tlspsks=${this.tlspsks}/tlspskd=${this.tlspskd}/tlspsktot=${this.tottlspsk} ` +
       `n=${this.bp[4]}/adj=${this.bp[3]} ` +
       `load=${this.bp[0]}/${this.bp[1]}/${this.bp[2]}`
     );
@@ -186,7 +195,7 @@ class Tracker {
     }
 
     cmap.set(connid, new ConnW(sock));
-    sock.on("close", (haderr) => cmap.delete(connid));
+    sock.on("close", (_haderr) => cmap.delete(connid));
 
     return connid;
   }
@@ -232,9 +241,10 @@ const tlsSessions = new LfuCache("tlsSessions", 10000);
 const cpucount = os.cpus().length || 1;
 const adjPeriodSec = 5;
 const maxHeapSnaps = 20;
+const maxCertUpdateAttempts = 20;
 let adjTimer = null;
 
-((main) => {
+((_main) => {
   // listen for "go" and start the server
   system.sub("go", systemUp);
   // listen for "end" and stop the server
@@ -247,7 +257,7 @@ function systemDown() {
   // system-down even may arrive even before the process has had the chance
   // to start, in which case globals like env and log may not be available
   const upmins = (uptime() / 60000) | 0;
-  console.warn("W rcv stop; uptime", upmins, "mins", stats.str());
+  log2.w("W rcv stop; uptime", upmins, "mins", stats.str());
 
   const shutdownTimeoutMs = envutil.shutdownTimeoutMs();
   // servers will start rejecting conns when tracker is empty
@@ -256,7 +266,7 @@ function systemDown() {
   util.timeout(shutdownTimeoutMs, bye);
 
   if (adjTimer) clearInterval(adjTimer);
-  // 0 is ignored; github.com/nodejs/node/pull/48276
+  // 0 was ignored; github.com/nodejs/node/pull/48276
   // accept only 1 conn (which keeps health-checks happy)
   adjustMaxConns(1);
 
@@ -264,7 +274,7 @@ function systemDown() {
   // TODO: handle proxy protocol sockets
   for (const m of cmap) {
     if (!m) continue;
-    console.warn("W closing...", m.size, "connections");
+    log2.w("W closing...", m.size, "connections");
     for (const v of m.values()) {
       close(v.socket);
     }
@@ -275,7 +285,7 @@ function systemDown() {
   for (const s of srvs) {
     if (!s || !s.listening) continue;
     const saddr = s.address();
-    console.warn("W stopping...", saddr);
+    log2.w("W stopping...", saddr);
     s.close(() => down(saddr));
     s.unref();
   }
@@ -285,7 +295,7 @@ function systemDown() {
 }
 
 function systemUp() {
-  log = util.logger("NodeJs");
+  log = loggerWithTags("NodeJs");
   if (!log) throw new Error("logger unavailable on system up");
 
   const downloadmode = envutil.blocklistDownloadOnly();
@@ -298,6 +308,7 @@ function systemUp() {
   const ioTimeoutMs = envutil.ioTimeoutMs();
   const supportsHttp2 = envutil.isNode() || envutil.isDeno();
   const isBun = envutil.isBun();
+  let allowTlsPsk = envutil.allowTlsPsk();
 
   if (downloadmode) {
     log.i("in download mode, not running the dns resolver");
@@ -311,6 +322,18 @@ function systemUp() {
     log.i(`cpu ${cpucount}, ip ${zero6}, tcpb ${tcpbacklog}, c ${maxconns}`);
   }
 
+  /** @type {Uint8Array?} */
+  let tlsPsk = null;
+  if (allowTlsPsk) {
+    const pskhex = envutil.tlsPskHex();
+    tlsPsk = bufutil.hex2buf(pskhex);
+    if (bufutil.len(tlsPsk) < psk.minkeyentropy) {
+      log.e("TLS_PSK disabled; seed not", psk.minkeyentropy, "bytes long");
+      allowTlsPsk = false;
+      if (envManager != null) envManager.set("TLS_PSK", ""); // disable
+    }
+  }
+
   // nodejs.org/api/net.html#netcreateserveroptions-connectionlistener
   /** @type {net.ServerOpts} */
   const serverOpts = {
@@ -318,31 +341,75 @@ function systemUp() {
     noDelay: true,
   };
   // default cipher suites
-  // nodejs.org/api/tls.html#modifying-the-default-tls-cipher-suite
-  let defaultTlsCiphers = "";
-  if (!util.emptyString(tls.DEFAULT_CIPHERS)) {
-    // nodejs.org/api/tls.html#tlsdefault_ciphers
-    defaultTlsCiphers = tls.DEFAULT_CIPHERS;
-  } else {
-    // nodejs.org/api/tls.html#tlsgetciphers
-    defaultTlsCiphers = tls
-      .getCiphers()
-      .map((c) => c.toUpperCase())
-      .join(":");
-  }
+  // nodejs.org/api/tls.html#tlsdefault_ciphers
+  // nodejs.org/api/tls.html#tlsgetciphers
+  const ciphers = !util.emptyString(tls.DEFAULT_CIPHERS)
+    ? tls.DEFAULT_CIPHERS.split(":")
+    : tls.getCiphers();
+  // defaultTlsCiphers contains "!PSK" and so, this must be appended before it.
+  const defaultTlsCiphers = ciphers
+    .map((c) => c.toUpperCase())
+    .filter((c) => !c.startsWith("!PSK"))
+    .join(":");
   // aes128 is a 'cipher string' for tls1.2 and below
+  // nodejs.org/api/tls.html#modifying-the-default-tls-cipher-suite
   // docs.openssl.org/1.1.1/man1/ciphers/#cipher-strings
-  const preferAes128 =
-    "AES128:TLS_AES_128_CCM_SHA256:TLS_AES_128_CCM_8_SHA256:TLS_AES_128_GCM_SHA256";
+  let preferAes128 =
+    "TLS_AES_128_CCM_SHA256:TLS_AES_128_CCM_8_SHA256:TLS_AES_128_GCM_SHA256:AES128";
+  if (allowTlsPsk) {
+    preferAes128 = preferAes128 + ":aPSK" + ":" + defaultTlsCiphers;
+  } else if (!isBun) {
+    preferAes128 = preferAes128 + ":" + defaultTlsCiphers + ":!PSK";
+  }
+  log.d(preferAes128);
   // nodejs.org/api/tls.html#tlscreateserveroptions-secureconnectionlistener
-  /** @type {tls.SecureContextOptions} */
+  /** @type {tls.TlsOptions} */
   const tlsOpts = {
-    ciphers: preferAes128 + ":" + defaultTlsCiphers,
+    // github.com/oven-sh/bun/issues/18865
+    ciphers: isBun ? undefined : preferAes128,
     honorCipherOrder: true,
     handshakeTimeout: Math.max((ioTimeoutMs / 2) | 0, 3 * 1000), // 3s in ms
     // blog.cloudflare.com/tls-session-resumption-full-speed-and-secure
     sessionTimeout: 60 * 60 * 24 * 7, // 7d in secs
   };
+  // Node does not support PSK importers (TLS 0 RTT)
+  // timtaubert.de/blog/2015/11/more-privacy-less-latency-improved-handshakes-in-tls-13
+  if (allowTlsPsk) {
+    // tlsOpts.enableTrace = true;
+    /**
+     * timtaubert.de/blog/2017/02/the-future-of-session-resumption
+     * @param {TLSSocket} _socket - TLS Socket
+     * @param {string} idhex - Identifier in hex
+     * @returns {DataView}
+     */
+    tlsOpts.pskCallback = (_socket, idhex) => {
+      stats.tottlspsk += 1;
+      if (!bufutil.isHex(idhex)) return;
+
+      // openssl s_client -reconnect -tls1_2 -psk_identity 790bb45383670663ce9a39480be2de5426179506c8a6b2be922af055896438dd06dd320e68cd81348a32d679c026f73be64fdbbc46c43bfbc0f98160ffae2452
+      // -psk "$TLS_PSK" -connect dns.rethinkdns.localhost:10000 -debug -cipher "PSK-AES128-GCM-SHA256"
+      /** @type {psk.PskCred?} */
+      const creds = psk.recentPskCreds.get(idhex);
+      if (creds && creds.ok()) {
+        // log.d("TLS1.2 PSK: known client", creds.idhexhint);
+        if (idhex === creds.idhex) stats.tlspsks += 1;
+        else stats.tlspskd += 1;
+        // TODO: confirm creds.key is compatible with socket.getCipher();
+        return creds.key;
+      }
+
+      // async callbacks are not possible yet, and so, generate the
+      // missing credentials in the next microtask and fail this one;
+      // hopefully, the next time this same idhex connects, we'll have
+      // generated the corresponding PSK credentials to serve it.
+      psk.generateTlsPsk(bufutil.hex2buf(idhex));
+      // log.d("TLS1.2 PSK: unknown client id", idhex);
+      stats.tlspskmiss += 1;
+      return null;
+    };
+    tlsOpts.pskIdentityHint = psk.serverid;
+    log.i("TLS1.2 PSK identity hint", tlsOpts.pskIdentityHint);
+  }
   // nodejs.org/api/http2.html#http2createsecureserveroptions-onrequesthandler
   const h2Opts = {
     allowHTTP1: true,
@@ -380,9 +447,10 @@ function systemUp() {
       });
   } else {
     // terminate tls ourselves
+    /** @type {tls.TlsOptions} */
     const secOpts = {
-      key: envutil.tlsKey(),
-      cert: envutil.tlsCrt(),
+      key: bufutil.fromB64(envutil.tlsKey()),
+      cert: bufutil.fromB64(envutil.tlsCrt()),
       ...tlsOpts,
       ...serverOpts,
     };
@@ -398,6 +466,7 @@ function systemUp() {
     // DNS over TLS
     const dot1 = tls.createServer(secOpts, serveTLS).listen(dot1Opts, () => {
       up("DoT", dot1.address());
+      certUpdateForever(secOpts, dot1);
       trapSecureServerEvents("dot1", dot1);
     });
 
@@ -415,6 +484,7 @@ function systemUp() {
         .createSecureServer({ ...secOpts, ...h2Opts }, serveHTTPS)
         .listen(dohOpts, () => {
           up("DoH2", doh.address());
+          certUpdateForever(secOpts, doh);
           trapSecureServerEvents("doh2", doh);
         });
     } else if (isBun) {
@@ -422,10 +492,11 @@ function systemUp() {
         .createServer(secOpts, serveHTTPS)
         .listen(dohOpts, () => {
           up("DoH1", doh.address());
-          trapSecureServerEvents("doh1", doh);
+          certUpdateForever(secOpts, doh);
+          trapSecureServerEvents("dohb1", doh);
         });
     } else {
-      console.log("unsupported runtime for doh");
+      log2.i("unsupported runtime for doh");
     }
   }
 
@@ -436,6 +507,87 @@ function systemUp() {
   });
 
   heartbeat();
+}
+
+/**
+ * @param {tls.TlsOptions} secopts
+ * @param {tls.Server} s
+ * @param {int} n
+ */
+async function certUpdateForever(secopts, s, n = 0) {
+  if (n > maxCertUpdateAttempts) {
+    log2.e("crt: max update attempts reached", n);
+    return false;
+  }
+
+  const crtpem = secopts.cert;
+  if (bufutil.emptyBuf(crtpem)) {
+    return false;
+  }
+
+  // nodejs.org/api/tls.html#tlsgetcertificates
+  // nodejs.org/api/tls.html#certificate-object
+  const crt = new X509Certificate(crtpem);
+
+  if (!crt) return false;
+  else logCertInfo(crt);
+
+  const oneDayMs = 24 * 60 * 60 * 1000; // in ms
+  const validUntil = new Date(crt.validTo).getTime() - Date.now();
+  if (validUntil > oneDayMs) {
+    log2.i("crt: #", n, "update: valid for", validUntil, "ms; not needed");
+    util.timeout(validUntil - oneDayMs, () => certUpdateForever(secopts, s));
+    return false;
+  }
+
+  const oneMinMs = 1 * 60 * 1000; // in ms
+  const sixMinMs = 6 * 60 * 1000; // in ms
+  const [latestKey, latestCert] = await nodeutil.replaceKeyCert(crt);
+  if (bufutil.emptyBuf(latestKey) || bufutil.emptyBuf(latestCert)) {
+    n = n + 1;
+    const attemptsLeft = Math.max(1, maxCertUpdateAttempts - n);
+    let when = validUntil <= oneMinMs ? oneMinMs : sixMinMs * attemptsLeft;
+    if (validUntil > oneMinMs && when > validUntil) {
+      when = Math.max(oneMinMs, validUntil - oneMinMs);
+    }
+    log2.e("crt: #", n, "update: no key/cert fetched; next", when);
+    util.timeout(when, () => certUpdateForever(secopts, s, n));
+    return false;
+  }
+
+  const latestcrt = new X509Certificate(latestCert);
+
+  if (!latestcrt) return false;
+  else logCertInfo(latestcrt);
+
+  secopts.cert = latestCert;
+  secopts.key = latestKey;
+  setTlsVars(latestKey, latestCert);
+
+  s.setSecureContext(secopts);
+
+  log2.i("crt: #", n, "update: set new cert");
+  util.next(() => certUpdateForever(secopts, s));
+
+  return true;
+}
+
+/**
+ * @param {X509Certificate} crt
+ */
+function logCertInfo(crt) {
+  if (!crt) {
+    return;
+  }
+  log2.i(
+    crt.serialNumber, // AF163398B8095EA6D273CC9B50E95DC3
+    crt.issuer, // C=AT, O=ZeroSSL, CN=ZeroSSL ECC Domain Secure Site CA
+    crt.subject, // CN=max.rethinkdns.com
+    crt.fingerprint256, // 82:74:47:E6:A1:77:33:CD:1D:40:27:D4:B2:8B:E7:71:11:F9:F1:2C:D4:46:9D:3E:0D:84:89:B9:10:E7:32:5A
+    crt.subjectAltName, // DNS:*.basic.rethinkdns.com, DNS:*.pro.rethinkdns.com, DNS:*.sky.rethinkdns.com, DNS:basic.rethinkdns.com, DNS:pro.rethinkdns.com
+    crt.validFrom, // "Nov 20 00:00:00 2024 GMT"
+    crt.validTo // "Jan 19 23:59:59 2025 GMT"
+  );
 }
 
 /**
@@ -487,7 +639,7 @@ function trapServerEvents(id, s) {
   });
 
   // emitted when the req is discarded due to maxConnections
-  s.on("drop", (data) => {
+  s.on("drop", (_data) => {
     stats.nofdrops += 1;
     stats.nofconns += 1;
   });
@@ -553,14 +705,16 @@ function trapSecureServerEvents(id, s) {
     });
   });
 
-  const rottm = util.repeat(86400000 * 7, () => rotateTkt(s)); // 7d
+  const rottm = util.repeat(86400000 * 7, () => rotateTkt(id, s)); // 7d
   s.on("close", () => clearInterval(rottm));
 
   s.on("error", (err) => {
-    log.e("tls: stop! server error; " + err.message, err);
+    log.e("tls: stop!", id, "server err; " + err.message, err);
     stopAfter(0);
   });
 
+  // timtaubert.de/blog/2017/02/the-future-of-session-resumption
+  // timtaubert.de/blog/2015/11/more-privacy-less-latency-improved-handshakes-in-tls-13
   // bajtos.net/posts/2013-08-07-improve-the-performance-of-the-node-js-https-server
   // session tickets take precedence over session ids; -no_ticket is needed
   // openssl s_client -connect :10000 -reconnect -tls1_2 -no_ticket
@@ -575,17 +729,15 @@ function trapSecureServerEvents(id, s) {
 
   s.on("resumeSession", (id, next) => {
     const hid = bufutil.hex(id);
-
     const data = tlsSessions.get(hid) || null;
     // log.d("tls: resume;", hid, "ok?", data != null);
     if (data) stats.fasttls += 1;
     else stats.totfasttls += 1;
-
-    next(/* err*/ null, null);
+    next(/* err */ null, data);
   });
 
   // emitted when the req is discarded due to maxConnections
-  s.on("drop", (data) => {
+  s.on("drop", (_data) => {
     stats.nofdrops += 1;
     stats.nofconns += 1;
   });
@@ -593,53 +745,42 @@ function trapSecureServerEvents(id, s) {
   s.on("tlsClientError", (err, /** @type {TLSSocket} */ tlsSocket) => {
     stats.tlserr += 1;
     // fly tcp healthchecks also trigger tlsClientErrors
-    log.d("tls: client err;", err.message, addrstr(tlsSocket));
+    // log.d("tls: client err;", err.message, addrstr(tlsSocket));
     close(tlsSocket);
   });
 }
 
 /**
- * @param {TLSSocket|Socket} sock
- */
-function addrstr(sock) {
-  if (!sock) return "";
-  if (sock.localAddress == null || sock.remoteAddress == null) return "";
-  return (
-    `[${sock.localAddress}]:${sock.localPort}` +
-    "->" +
-    `[${sock.remoteAddress}]:${sock.remotePort}`
-  );
-}
-
-/**
- * @param {tls.Server} s
+ * Rotates TLS session tickets.
+ * @param {string} id
+ * @param {tls.Server?} s
  * @returns {void}
  */
-function rotateTkt(s) {
+function rotateTkt(id, s) {
+  if (envutil.isCleartext()) return; // tls offload
   if (envutil.isBun()) return;
   if (!s || !s.listening) return;
 
   let seed = bufutil.fromB64(envutil.secretb64());
   if (bufutil.emptyBuf(seed)) {
-    seed = envutil.tlsKey();
+    // see: node/config.js:setTlsVars
+    seed = bufutil.fromB64(envutil.tlsKey());
   }
-  let ctx = envutil.imageRef();
-  if (!util.emptyString(ctx)) {
-    const d = new Date();
-    const cur = d.getUTCFullYear() + " " + d.getUTCMonth(); // 2023 7
-    ctx = cur + ctx;
-  }
-
+  const d = new Date();
+  const cur = d.getUTCFullYear() + " " + d.getUTCMonth(); // 2023 7
+  const ctx = cur + envutil.imageRef(); // may be empty str
   // tls session resumption with tickets (or ids) reduce the 3.5kb to 6.5kb
   // overhead associated with tls handshake: netsekure.org/2010/03/tls-overhead
   nodecrypto
     .tkt48(seed, ctx)
     .then((k) => s.setTicketKeys(k)) // not supported on bun
-    .catch((err) => log.e("tls: ticket rotation failed:", err));
+    .catch((err) => log.e("tls:", id, "tkt rotation err", err));
+
+  log.i("tls:", id, "tkt rotation", bufutil.len(seed), "ctx", ctx);
 }
 
 function down(addr) {
-  console.warn(`W closed: [${addr.address}]:${addr.port}`);
+  log2.w(`W closed: [${addr.address}]:${addr.port}`);
 }
 
 function up(server, addr) {
@@ -648,7 +789,7 @@ function up(server, addr) {
 
 /**
  * RST and/or closes tcp socket.
- * @param {Socket | TLSSocket} sock
+ * @param {Socket | TLSSocket | null} sock
  */
 function close(sock) {
   if (!sock || sock.destroyed) return;
@@ -658,14 +799,14 @@ function close(sock) {
 }
 
 /**
- * @param {Http2ServerResponse} res
+ * @param {Http2ServerResponse?} res
  */
 function resClose(res) {
   if (res && !res.destroy) res.destroy();
 }
 
 /**
- * @param {Http2ServerResponse} res
+ * @param {Http2ServerResponse?} res
  * @returns {Boolean}
  */
 function resOkay(res) {
@@ -674,20 +815,21 @@ function resOkay(res) {
 }
 
 /**
- * @param {Socket} sock
+ * @param {Socket?} sock
  * @returns {Boolean}
  */
 function tcpOkay(sock) {
-  return sock.writable;
+  return sock && sock.writable;
 }
 
 /**
  * Creates a duplex pipe between `a` and `b` sockets.
- * @param {Socket} a
- * @param {Socket} b
+ * @param {Socket?} a
+ * @param {Socket?} b
  * @return {Boolean} - true if pipe created, false if error
  */
 function proxySockets(a, b) {
+  if (!a || !b) return false;
   if (a.destroyed || b.destroyed) return false;
   // handle errors? stackoverflow.com/a/61091744
   a.pipe(b);
@@ -748,7 +890,7 @@ function serveDoTProxyProto(clientSocket) {
     }
   }
 
-  clientSocket.on("error", (e) => {
+  clientSocket.on("error", (_e) => {
     log.w("pp: client err, closing");
     close(clientSocket);
     close(dotSock);
@@ -834,10 +976,15 @@ function getDnRE(socket) {
 
 /**
  * Gets flag and hostname from the wildcard domain name.
- * @param {String} sni - Wildcard SNI
- * @return {Array<String>} [flag, hostname]
+ * @param {String?} sni - Wildcard SNI
+ * @return {<[String, String]>} [flag, hostname] - may be empty strings
  */
 function getMetadata(sni) {
+  const fakesni = envutil.allowDomainFronting() || envutil.allowTlsPsk();
+
+  if (util.emptyString(sni)) {
+    return ["", fakesni ? "nosni.tld" : ""];
+  }
   // 1-flag.max.rethinkdns.com => ["1-flag", "max", "rethinkdns", "com"]
   // 1-flag.somedomain.tld => ["1-flag", "somedomain", "tld"]
   const s = sni.split(".");
@@ -854,7 +1001,7 @@ function getMetadata(sni) {
     return [flag, host];
   } else {
     // sni => max.rethinkdns.com
-    log.d(`flag: "", host: ${host}`);
+    log.d(`flag: "", host: ${sni}`);
     return ["", sni];
   }
 }
@@ -865,23 +1012,25 @@ function getMetadata(sni) {
  */
 function serveTLS(socket) {
   const sni = socket.servername;
-  if (!sni) {
-    log.d("no sni, close conn");
-    close(socket);
-    return;
-  }
+  if (!envutil.allowDomainFronting() && !envutil.allowTlsPsk()) {
+    if (!sni) {
+      log.d("no sni, close conn");
+      close(socket);
+      return;
+    }
 
-  if (!OUR_RG_DN_RE || !OUR_WC_DN_RE) {
-    [OUR_RG_DN_RE, OUR_WC_DN_RE] = getDnRE(socket);
-  }
+    if (!OUR_RG_DN_RE || !OUR_WC_DN_RE) {
+      [OUR_RG_DN_RE, OUR_WC_DN_RE] = getDnRE(socket);
+    }
 
-  const isOurRgDn = OUR_RG_DN_RE.test(sni);
-  const isOurWcDn = OUR_WC_DN_RE.test(sni);
+    const isOurRgDn = OUR_RG_DN_RE.test(sni);
+    const isOurWcDn = OUR_WC_DN_RE.test(sni);
 
-  if (!isOurWcDn && !isOurRgDn) {
-    log.w("unexpected sni, close conn", sni);
-    close(socket);
-    return;
+    if (!isOurWcDn && !isOurRgDn) {
+      log.w("unexpected sni, close conn", sni);
+      close(socket);
+      return;
+    }
   }
 
   if (false) {
@@ -892,10 +1041,10 @@ function serveTLS(socket) {
     log.d(`(${proto}), reused? ${reused}; ticket: ${tkt}; sess: ${sess}`);
   }
 
-  const [flag, host] = isOurWcDn ? getMetadata(sni) : ["", sni];
+  const [flag, host] = getMetadata(sni);
   const sb = new ScratchBuffer();
 
-  log.d("----> dot request", host, flag);
+  log.d("----> dot request", flag, host);
   socket.on("data", async (data) => {
     const len = await handleTCPData(socket, data, sb, host, flag);
     adjustTLSFragAfterWrites(socket, len);
@@ -921,7 +1070,7 @@ function serveTCP(socket) {
 /**
  * Handle DNS over TCP/TLS data stream.
  * @param {Socket} socket
- * @param {Buffer} chunk - A TCP data segment
+ * @param {ArrayBuffer} chunk - A TCP data segment
  * @param {ScratchBuffer} sb - Scratch buffer
  * @param {String} host - Hostname
  * @param {String} flag - Blocklist Flag
@@ -960,7 +1109,7 @@ async function handleTCPData(socket, chunk, sb, host, flag) {
   // chunk out dns-query starting rem-th byte
   const data = chunk.slice(rem, qlimit);
   // out of band data, if any
-  const oob = chunk.slice(qlimit);
+  const oob = qlimit < cl ? chunk.slice(qlimit) : null;
 
   sb.allocOnce(qlen);
 
@@ -978,7 +1127,7 @@ async function handleTCPData(socket, chunk, sb, host, flag) {
     // if there is any out of band data, handle it
     if (!bufutil.emptyBuf(oob)) {
       log.d(`tcp: pipelined, handle oob: ${oob.byteLength}`);
-      n += handleTCPData(socket, oob, sb, host, flag);
+      n += await handleTCPData(socket, oob, sb, host, flag);
     }
   } // continue reading from socket
   return n;
@@ -1028,7 +1177,7 @@ async function handleTCPQuery(q, socket, host, flag) {
  * @param {string} rxid
  * @param {Socket} socket
  * @param {Uint8Array} data
- * @param {int} n - bytes written to socket
+ * @returns {int} n - bytes written to socket
  */
 function measuredWrite(rxid, socket, data) {
   let ok = tcpOkay(socket);
@@ -1354,7 +1503,7 @@ function bye() {
   // in some cases, node stops listening but the process doesn't exit because
   // of other unreleased resources (see: svc.js#systemStop); and so exit with
   // success (exit code 0) regardless; ref: community.fly.io/t/4547/6
-  console.warn("W game over");
+  log2.w("W game over");
 
   if (envutil.isNode()) v8.writeHeapSnapshot("snap.end.heapsnapshot");
 

@@ -11,6 +11,7 @@ import * as bufutil from "../../commons/bufutil.js";
 import * as envutil from "../../commons/envutil.js";
 import * as util from "../../commons/util.js";
 import * as cfg from "../../core/cfg.js";
+import { log } from "../../core/log.js";
 import * as pres from "../plugin-response.js";
 import * as rdnsutil from "../rdns-util.js";
 import { BlocklistFilter } from "./filter.js";
@@ -50,7 +51,7 @@ export class BlocklistWrapper {
   async init(rxid, forceget = false) {
     if (this.isBlocklistFilterSetup() || this.disabled()) {
       const blres = pres.emptyResponse();
-      blres.data.blocklistFilter = this.blocklistFilter;
+      blres.data.blocklistFilter = this.blocklistFilter; // may be nil
       return blres;
     }
 
@@ -417,6 +418,7 @@ function todayAsDateInfo() {
 /**
  * Main function to prefetch files based on week, month, and year.
  * @param {string} baseurl
+ * @returns {Promise<[Object?, Object?]>} [basicconfig, filetag]
  */
 async function renew(baseurl) {
   let { week: wk, month: mm, year: yyyy, timestamp: now } = todayAsDateInfo();
@@ -457,6 +459,7 @@ async function renew(baseurl) {
           else log.w(`failed to fetch ${tagUrl}`);
         }
       }
+      log.w(`renew #${i} failed for:`, bconfig);
     } catch (ex) {
       // ex: 4xx, 5xx
       log.w(`renew #${i} err; retrying...`, ex);
@@ -479,19 +482,22 @@ async function renew(baseurl) {
 }
 
 /**
+ * Returns true if the timestamp is older than wk weeks, per Date.now()
  * @param {int} tsms (in unix millis)
  * @param {int} wk (in weeks > 0)
  * @returns {bool}
  */
-function isPast(tsms, wk) {
-  if (tsms <= 0 || wk <= 0) return false;
+export function isPast(tsms, wk) {
+  if (tsms <= 0 || wk <= 0) {
+    log.w("isPast: bad args ts/wk", tsms, wk);
+    return false;
+  }
 
   const since = Date.now() - tsms;
   const sinceWeeks = Math.floor(since / (1000 * 60 * 60 * 24 * 7));
 
   const y = sinceWeeks > wk;
-  if (y) {
-    log.w("blocklist is old:", sinceWeeks, ">", wk);
-  }
+  const note = y ? log.w : log.i;
+  note("blocklist old?", y, sinceWeeks, ">", wk, " / s:", since, "ts:", tsms);
   return y;
 }
